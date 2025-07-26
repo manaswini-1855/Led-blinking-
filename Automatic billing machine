@@ -1,0 +1,238 @@
+#include "LPC17xx.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define RS (1 << 10)
+#define EN (1 << 11)
+#define DATA_MASK (0x0F << 19)
+
+char* items[10] = {
+    "Idly", "Vada", "Upma", "Pongal", "eggDosa",
+    "Bonda", "FryBiriyani", "DhumBiriyani", "FamilyPack", "Water"
+};
+
+int prices[10] = {20, 20, 10, 25, 40, 40, 230, 230, 550, 10};
+int quantities[10] = {0};  // Track quantity for each item
+
+int unique_items[10];      // Track added item indexes
+int unique_count = 0;
+int total = 0;
+int scroll_index = -1;
+
+uint8_t row_pins[4] = {4, 5, 6, 7};  // P2.4 to P2.7
+uint8_t col_pins[4] = {0, 1, 2, 3};  // P2.0 to P2.3
+
+char keypad[4][4] = {
+    {'1','2','3','A'},
+    {'4','5','6','B'},
+    {'7','8','9','C'},
+    {'*','0','#','D'}
+};
+
+void delay_ms(int ms) {
+    for (int i = 0; i < ms * 10000; i++);
+}
+
+void lcd_pulse_enable(void) {
+    LPC_GPIO0->FIOSET = EN;
+    delay_ms(1);
+    LPC_GPIO0->FIOCLR = EN;
+    delay_ms(1);
+}
+
+void lcd_send_nibble(uint8_t nibble) {
+    LPC_GPIO0->FIOCLR = DATA_MASK;
+    LPC_GPIO0->FIOSET = (nibble & 0x0F) << 19;
+    lcd_pulse_enable();
+}
+
+void lcd_command(uint8_t cmd) {
+    LPC_GPIO0->FIOCLR = RS;
+    lcd_send_nibble(cmd >> 4);
+    lcd_send_nibble(cmd & 0x0F);
+    delay_ms(2);
+}
+
+void lcd_data(uint8_t data) {
+    LPC_GPIO0->FIOSET = RS;
+    lcd_send_nibble(data >> 4);
+    lcd_send_nibble(data & 0x0F);
+    delay_ms(2);
+}
+
+void lcd_init(void) {
+    LPC_GPIO0->FIODIR |= RS | EN | DATA_MASK;
+    delay_ms(40);
+    lcd_command(0x02);
+    lcd_command(0x28);
+    lcd_command(0x0C);
+    lcd_command(0x06);
+    lcd_command(0x01);
+    delay_ms(2);
+}
+
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+    uint8_t address = (row == 0) ? 0x00 : 0x40;
+    lcd_command(0x80 | (address + col));
+}
+
+void lcd_print(const char *str) {
+    while (*str) {
+        lcd_data(*str++);
+    }
+}
+
+void init_keypad(void) {
+    for (int i = 0; i < 4; i++) {
+        LPC_GPIO2->FIODIR |= (1 << row_pins[i]);
+        LPC_GPIO2->FIOSET = (1 << row_pins[i]);
+    }
+    for (int i = 0; i < 4; i++) {
+        LPC_GPIO2->FIODIR &= ~(1 << col_pins[i]);
+    }
+}
+
+char scan_keypad(void) {
+    for (int row = 0; row < 4; row++) {
+        LPC_GPIO2->FIOCLR = (1 << row_pins[row]);
+        for (int col = 0; col < 4; col++) {
+            if (!(LPC_GPIO2->FIOPIN & (1 << col_pins[col]))) {
+                delay_ms(20);
+                while (!(LPC_GPIO2->FIOPIN & (1 << col_pins[col])));
+                LPC_GPIO2->FIOSET = (1 << row_pins[row]);
+                return keypad[row][col];
+            }
+        }
+        LPC_GPIO2->FIOSET = (1 << row_pins[row]);
+    }
+    return '\0';
+}
+
+void add_item(int index) {
+    quantities[index]++;
+    total += prices[index];
+
+    // Add to unique list if first time
+    int found = 0;
+    for (int i = 0; i < unique_count; i++) {
+        if (unique_items[i] == index) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        unique_items[unique_count++] = index;
+    }
+
+    lcd_command(0x01);
+    lcd_set_cursor(0, 0);
+    lcd_print("Added: ");
+    lcd_print(items[index]);
+
+    lcd_set_cursor(1, 0);
+    char buf[32];
+    sprintf(buf, "Qty:%d T:%d", quantities[index], total);
+    lcd_print(buf);
+}
+
+void scroll_items() {
+    if (unique_count == 0) {
+        lcd_command(0x01);
+        lcd_set_cursor(0, 0);
+        lcd_print("No items added");
+        return;
+    }
+
+    scroll_index = (scroll_index + 1) % unique_count;
+    int index = unique_items[scroll_index];
+
+    lcd_command(0x01);
+    lcd_set_cursor(0, 0);
+    lcd_print(items[index]);
+
+    lcd_set_cursor(1, 0);
+    char buf[32];
+    sprintf(buf, "Qty:%d T:%d", quantities[index], total);
+    lcd_print(buf);
+}
+
+void delete_item() {
+    if (unique_count == 0 || scroll_index == -1) {
+        lcd_command(0x01);
+        lcd_set_cursor(0, 0);
+        lcd_print("Nothing to delete");
+        return;
+    }
+
+    int index = unique_items[scroll_index];
+
+    if (quantities[index] > 0) {
+        quantities[index]--;
+        total -= prices[index];
+
+        // Remove from list if quantity becomes 0
+        if (quantities[index] == 0) {
+            for (int i = scroll_index; i < unique_count - 1; i++) {
+                unique_items[i] = unique_items[i + 1];
+            }
+            unique_count--;
+            if (scroll_index >= unique_count) scroll_index = 0;
+        }
+
+        lcd_command(0x01);
+        lcd_set_cursor(0, 0);
+        lcd_print("Deleted: ");
+        lcd_print(items[index]);
+
+        lcd_set_cursor(1, 0);
+        char buf[32];
+        sprintf(buf, "Qty:%d T:%d", quantities[index], total);
+        lcd_print(buf);
+    }
+}
+
+void reset_all() {
+    for (int i = 0; i < 10; i++) quantities[i] = 0;
+    total = 0;
+    unique_count = 0;
+    scroll_index = -1;
+
+    lcd_command(0x01);
+    lcd_set_cursor(0, 0);
+    lcd_print("THANK YOU");
+}
+
+void handle_key(char key) {
+    if (key >= '1' && key <= '9') {
+        int index = key - '1';
+        add_item(index);
+    } else if (key == 'A') {
+        scroll_items();
+    } else if (key == 'C') {
+        delete_item();
+    } else if (key == '#') {
+        reset_all();
+    } else {
+        lcd_command(0x01);
+        lcd_set_cursor(0, 0);
+        lcd_print("Invalid Key");
+    }
+}
+
+int main(void) {
+    lcd_init();
+    init_keypad();
+
+    lcd_command(0x01);
+    lcd_set_cursor(0, 0);
+    lcd_print("Select Item:");
+
+    while (1) {
+        char key = scan_keypad();
+        if (key != '\0') {
+            handle_key(key);
+            delay_ms(300);
+        }
+    }
+}
