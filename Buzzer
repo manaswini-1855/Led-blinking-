@@ -1,0 +1,115 @@
+#include <LPC17xx.h>
+#include <stdio.h>  // For sprintf()
+
+#define TRIG_PIN (1 << 11)    // P2.10 as trigger
+#define ECHO_PIN (1 << 12)    // P2.11 as echo
+#define BUZZER_PIN (1 << 27)  // P1.27 as buzzer
+
+volatile uint32_t start_time = 0, end_time = 0, pulse_width = 0;
+volatile uint8_t echo_received = 0;
+
+void GPIO_Init(void);
+void Timer_Init(void);
+//void UART1_Init(void);
+//void UART1_SendString(char *str);
+void Trigger_Sensor(void);
+float Calculate_Distance(void);
+uint32_t Get_Time(void);
+
+void GPIO_Init(void) {
+    LPC_GPIO2->FIODIR |= TRIG_PIN ;  // Set trigger and buzzer pins as output
+		LPC_GPIO1->FIODIR |= BUZZER_PIN; 
+    LPC_GPIO2->FIODIR &= ~ECHO_PIN;             // Set echo pin as input
+    LPC_GPIOINT->IO2IntEnR |= ECHO_PIN;         // Enable rising edge interrupt
+    LPC_GPIOINT->IO2IntEnF |= ECHO_PIN;         // Enable falling edge interrupt
+    NVIC_EnableIRQ(EINT3_IRQn);                 // Enable GPIO interrupt
+}
+
+void Timer_Init(void) {
+    LPC_SC->PCONP |= (1 << 1);        // Power on Timer 0
+    LPC_SC->PCLKSEL0 |= (1 << 2);     // Set Timer 0 clock to CCLK (100 MHz)
+    LPC_TIM0->TCR = 2;                // Reset Timer 0
+    LPC_TIM0->PR = 99;                // Prescale for 1 µs (100 MHz / 100 - 1)
+    LPC_TIM0->TCR = 1;                // Enable Timer 0
+}
+
+uint32_t Get_Time(void) {
+    return LPC_TIM0->TC; // Timer Counter
+}
+
+void UART1_Init(void) {
+    LPC_SC->PCONP |= 0x10;            // Power up UART1 (PCUART1)
+    LPC_PINCON->PINSEL4 |= 0x0000000A; // Configure P2.0 as TXD1 and P2.1 as RXD1
+    LPC_UART1->LCR = 0x83;            // Enable DLAB and set 8-bit word length
+    LPC_UART1->DLM = 0x00;            // Set baud rate divisor (high byte)
+    LPC_UART1->DLL = 0xA2;            // Set baud rate divisor (low byte) for 9600 bps
+    LPC_UART1->LCR = 0x03;            // Disable DLAB, 8-bit word length
+    LPC_UART1->FCR = 0x07;            // Enable FIFO and clear TX/RX FIFOs
+}
+
+void UART1_SendString(char *str) {
+    while (*str) {
+        while (!(LPC_UART1->LSR & 0x20));  // Wait for THR to be empty
+        LPC_UART1->THR = *str++;           // Transmit character
+    }
+} 
+
+void EINT3_IRQHandler(void) {
+    if (LPC_GPIOINT->IO2IntStatR & ECHO_PIN) { // Rising edge detected
+        start_time = Get_Time();
+        LPC_GPIOINT->IO2IntClr |= ECHO_PIN;   // Clear interrupt flag
+    }
+
+    if (LPC_GPIOINT->IO2IntStatF & ECHO_PIN) { // Falling edge detected
+        end_time = Get_Time();
+        pulse_width = end_time - start_time;
+        echo_received = 1;                    // Signal that echo is received
+        LPC_GPIOINT->IO2IntClr |= ECHO_PIN;   // Clear interrupt flag
+    }
+}
+
+void Trigger_Sensor(void) {
+    LPC_GPIO2->FIOSET = TRIG_PIN;     // Set trigger pin high
+    for (uint32_t i = 0; i < 100000; i++) {}; // 10 µs delay
+    LPC_GPIO2->FIOCLR = TRIG_PIN;     // Set trigger pin low
+}
+
+float Calculate_Distance(void) {
+    return (pulse_width * 0.0343) / 2; // Distance in cm (speed of sound: 343 m/s)
+}
+
+void Buzzer_On(void) {
+    LPC_GPIO1->FIOSET = BUZZER_PIN;   // Turn on buzzer
+}
+
+void Buzzer_Off(void) {
+    LPC_GPIO1->FIOCLR = BUZZER_PIN;   // Turn off buzzer
+}
+
+int main(void) {
+    float distance;
+    char buffer[50];
+    const float distance_threshold = 10.0; // Threshold distance in cm
+
+    GPIO_Init();
+    Timer_Init();
+    UART1_Init();
+
+    while (1) {
+        Trigger_Sensor();
+        while (!echo_received) { };       // Wait for echo
+        echo_received = 0;           // Reset flag
+        distance = Calculate_Distance();
+
+        // Format the distance as a string and send via UART
+        sprintf(buffer, "Distance: %.2f cm\n", distance);
+          UART1_SendString(buffer);
+
+        // Activate buzzer if distance is below the threshold
+        if (distance < distance_threshold) {
+            Buzzer_On();
+        } else {
+            Buzzer_Off();
+        }
+    }
+}
